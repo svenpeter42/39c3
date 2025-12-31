@@ -4,7 +4,7 @@
 		<meta charset="utf-8">
 		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 
-		<title>reveal.js</title>
+		<title>39c3 | Asahi Linux</title>
 
 		<link rel="stylesheet" href="dist/reset.css">
 		<link rel="stylesheet" href="dist/reveal.css">
@@ -16,8 +16,364 @@
 	<body>
 		<div class="reveal">
 			<div class="slides">
-				<section>Slide 1</section>
-				<section>Slide 2</section>
+<section data-markdown="">
+# Asahi Linux
+## Porting Linux to Apple Silicon
+
+39c3  
+Sven Peter  
+email: sven@svenpeter.dev  
+fedi: [@sven@treehouse.systems](https://social.treehouse.systems/@sven)    
+https://asahilinux.org
+</section>
+
+<section data-markdown="" style="font-size: 20px;">
+# Credits
+* marcan: Started the project, built much of the tooling and many drivers, and support a lot of other contributors
+* Alyssa Rosenzweig: Lead the graphics driver work
+* Asahi Lina: Wrote the GPU kernel driver, ISP
+* Dougall Johnson: GPU instruction set reverse engineering
+* Janne: Downstream kernel maintainenance, DCP, GPU kernel driver, HID, etc.
+* Sven: Upstream kernel maintanance, Type-C, IOMMU, Bluetooth, etc.
+* Povik: TI amplification chip, I2S
+* Eileen: ISP (camera), microphones, hardware video en/decoder, neural engine 
+* Mark Kettenis: u-boot and device tree binding support
+* Marc Zyngier: PCIe, KVM and perf
+* Chadmed: Audio, Progress Reports, etc. 
+* chaos_princess: SPMI, GPU kernel driver, microhpones, touchbar, and nvram
+* Neal Gompa and Davide Cavalca: Fedora Asahi Remix 
+* All the other people working on kernel drivers, userspace tooling, helping users, building support for other distributions, testing our code and reporting bugs
+* And every OpenCollective contributor which allowed us to buy hardware and do funded development!
+* And special thanks to noopwafel, elly, jix, and shiz for helping with the slides!
+</section>
+
+<section data-markdown="">
+* The past: How it all started, what currently works, how we reverse hardware
+* The present: Reverse engineering Type-C 
+* The future: M3/M4/M5
+</section>
+
+<section>
+	<section data-markdown="">
+		# The past
+	</section>
+	<section data-markdown="">
+		* Apple announces ARM Macs with their own Silicon in 2020
+		* Hector Martin announces the effort to port Linux to Apple Silicon with a Patreon project to get started on November 30, 2020
+		* Asahi Linux is announced in December 2020.
+		* In April 2021, the first patches are merged into the upstream kernel tree
+		* In early 2022, the first Alpha release of Asahi Linux was released
+	</section>
+	<section data-markdown="">
+		* *Any* macho binary can be booted by using "1 True Recovery" mode
+		  * Assert physical presence by long-pressing power button
+		  * Authenticate with machine owner password
+		* You then get dropped into EL2
+		* No Apple code is running on the main CPU at this point.
+		* Significant engineering effort went into this by Apple
+	</section>
+	<section data-markdown="">
+		_No exploits or similar are required_  
+		This is all intentionally allowed by Apple
+	</section>
+	<section>
+		<img src="xeno.png">
+	</section>
+	<section>
+		<img src="boot_simple.drawio.png" width="50%">
+	</section>
+	<section>
+		<img src="asahi_bootpicker.png">
+	</section>
+	<section data-markdown="">
+		* Linux needs an interrupt controller and a timer to boot
+		* Timer is just the architectural ARM one
+		* Interrupt controller is AIC for which there is no documentation or driver available
+		* ... but we know where its registers are and how they are called from open-source XNU drops
+	</section>
+	<section data-markdown="">
+		# m1n1
+		* Back when we reverse engineered the Wii we built mini which had a small RPC proxy
+		* Apple Silicon UART can be muxed out over USB
+		* Python shell on a separate machine which allows to poke hardware registers
+	</section>
+	<section data-markdown="">
+		* python reboot.py to reboot the target
+		* python shell.py to drop to a python shell which allows MMIO access
+		  * read32(), write32(), ...
+		  * Allocate memory on the device under test
+		  * Monitor MMIO ranges for changes
+		* Allows prototyping drivers in python
+		* Very quick development cycle
+	</section>
+	<section><pre><code data-trim data-noescape class="language-python" style="font-size: 12px;">
+def i2c_read_reg(addr, reg, reg_size):
+    p.set32(base + REG_CTL, CTL_MTR | CTL_MRR)
+    p.write32(base + REG_SMSTA, 0xffffffff)
+
+    p.write32(base + REG_MTXFIFO, MTXFIFO_START | (addr << 1))
+    p.write32(base + REG_MTXFIFO, MTXFIFO_STOP | reg)
+
+    while not (p.read32(base + REG_SMSTA) & SMSTA_XEN):
+        pass
+
+    p.write32(base + REG_MTXFIFO, MTXFIFO_START | (addr << 1) | 1)
+    p.write32(base + REG_MTXFIFO, MTXFIFO_READ | MTXFIFO_STOP | reg_size + 1)
+
+    res = []
+    while len(res) < reg_size+1:
+        v = p.read32(base + REG_MRXFIFO)
+        if v & 0x100:
+            continue
+        res.append(v)
+
+    if res[0] < reg_size:
+        print("only read %d instead of %d bytes" % (res[0], reg_size))
+    return res[1:]
+	</code></pre></section>
+	<section><img src="el123.drawio.png"></section>
+	<section><img src="el123_m1n1.drawio.png"></section>
+	<section><img src="el123_final.drawio.png"></section>
+	<section><pre><code data-trim data-noescape class="language-python" style="font-size: 16px;">
+class R_USB2PHY_MISCTUNE(Register32):
+    APBCLK_GATE_OFF = 29
+    REFCLK_GATE_OFF = 30
+
+class Usb2PhyRegs(RegMap):
+    USB2PHY_MISCTUNE = 0x1C, R_USB2PHY_MISCTUNE
+
+class PhyTracer(ADTDevTracer):
+    REGMAPS = [
+        Usb2PhyRegs,
+	# ....
+	]
+
+PhyTracer(hv, "/arm-io/atc-phy1", verbose=2).start()
+	</code></pre></section>
+	<section><pre style="font-size: 15pt;"><code data-trim data-noescape data-line-numbers="1-3|4-5|7-9|11-15">
+# [cpu0] Pass: msr OSLAR_EL1, x31 = 0 (OK) (OSLAR_EL1)
+# [cpu0] Shadow: mrs x12, MDSCR_EL1 = 0
+# [cpu0] Skip: msr ACC_CFG_EL1, x13 = d
+# [cpu0] PMGR R 28e0801d8+0:32 = 0xf0000ff -> 0xf0000ff
+# [cpu0] PMGR R 28e0801f0+0:32 = 0xf0000ff -> 0xf0000ff
+...
+# [cpu0] CPUSTART W 28e0d4000+c:32 = 0x0
+# [cpu0] CPUSTART W 28e0d4000+10:32 = 0x4
+# [cpu0] Starting guest secondary 0:2:2
+...
+# [Dwc3Tracer@/arm-io/usb-drd1] MMIO: R.4   0xb0228cd3c = 0xfc00000
+# [Dwc3Tracer@/arm-io/usb-drd1] MMIO: W.4   0xb0228cd3c = 0xfc00fc0
+# [Dwc3Tracer@/arm-io/usb-drd1] MMIO: R.4   0xb0228cd40 = 0x3c20060c
+# [Dwc3Tracer@/arm-io/usb-drd1] MMIO: W.4   0xb0228cd40 = 0x3c14060c
+# [Dwc3Tracer@/arm-io/usb-drd1] MMIO: R.4   0xb0228cd40 = 0x3c14060c
+	</code></pre></section>
+	<section>
+		<pre><code>curl https://alx.sh | sh</code></pre>
+		<img src="mba.jpg">
+	</section>
+	<section data-markdown="">
+		* Focus on features lead to large amount of downstream-only patches
+		* Since Febuary this year: Cleanup drivers and get them upstream
+		* Upstreamed this year: SMC, USB3 support, SPMI, Audio, Device Trees, GPU UAPI, final GPU userspace parts, ...
+		* Biggest kernel drivers still only downstream: display controller, GPU
+	</section>
+</section>
+<section>
+	<section data-markdown="">
+		# The present: USB Type-C
+	</section>
+	<section>
+		<ul>
+			<li class="fragment">1996: USB1.0: 1.5 Mbit/s low-speed</li>
+  			<li class="fragment">1998: USB1.1: 12 Mbit/s / full-speed</li>
+			<li class="fragment">2000: USB2.0: 480 Mbit/s / high-speed</li>
+			<li class="fragment">2008: USB3.0: 5 Gbit/s / super-speed</li>
+			<li class="fragment">2013: USB3.1: 10 Gbit/s / super-speed+</li>
+			<li class="fragment">2017: USB3.2: 20 Gbit/s / USB 20Gbps</li>
+		</ul>
+	</section>
+	<section>
+		<ul>
+			<li>1996: USB1.0: 1.5 Mbit/s low-speed / D+/-</li>
+  			<li>1998: USB1.1: 12 Mbit/s / full-speed</li>
+			<li>2000: USB2.0: 480 Mbit/s / high-speed</li>
+			<li>2008: USB3.0: 5 Gbit/s / USB 5Gbps</li>
+			<li>2013: USB3.1: 10 Gbit/s / USB 10Gbps</li>
+			<li>2017: USB3.2: 20 Gbit/s / USB 20Gbps</li>
+			<li class="fragment">2019: USB4: 40 Gbit/s / USB 40Gbps</li>
+		</ul>
+	</section>
+	<section>
+		<div class="r-stack">
+			<p class="fragment fade-out" data-fragment-index="0" style="font-size: 12px;"><img src="usb23.png"><br>https://commons.wikimedia.org/wiki/File:USB_2.0_and_3.0_connectors.png</p>
+			<p class="fragment current-visible" data-fragment-index="0" style="font-size: 12px;"><img src="usbmeme.jpg"></p>
+			<p class="fragment" style="font-size: 12px;"><img src="typec.svg" style="filter: invert(1);"><br>https://en.wikipedia.org/wiki/File:USB_Type-C_Receptacle_Pinout.svg</p>
+		</div>
+	</section>
+	<section>
+		<img src="usbcmeme0.png">
+	</section>
+	<section>
+		<img src="usbcmeme1.png">
+	</section>
+	<section>
+		<ul>
+			<li>USB1/2</li>
+			<li>USB3</li>
+			<li>Thunderbolt / USB4</li>
+			<li>DisplayPort</li>
+		</ul>
+	</section>
+	<section>
+		<img src="typec.drawio.png" width="90%">
+	</section>
+	<section>
+		<ul>
+			<li class="fragment">We know that iPhones used Synopsys Designware DWC2</li>
+			<li class="fragment">Poke MMIO with m1n1: It's Synopsys Designware DWC3 now</li>
+			<li class="fragment">Official datasheet not available, but registers, etc. published by e.g. Intel or Rockchip</li>
+			<li class="fragment">Linux has a driver which even used to be BSD/GPL dual-licensed years ago</li>
+		</ul>
+	</section>
+	<section>
+		<ul>
+			<li class="fragment">DWC3 and CDC ACM (serial) implemented in m1n1</li>
+			<li class="fragment">... but it only seems to work once</li>
+			<li class="fragment">Instantiate DWC3 in Linux</li>
+			<li class="fragment">... but it also only seems to work once</li>
+			<li class="fragment">... and it only works in device mode</li>
+		</ul>
+	</section>
+	<section><img src="deadbug.jpeg" style="float: left; width: 40%;">
+		<ul style="width: 55%">
+			<li>Type-C can carry up to 240W these days</li>
+			<li class="fragment">Has to be negotiated to prevent smoke</li>
+			<li class="fragment">Weird protocol over CC lines</li>
+			<li class="fragment">Also handles alternate modes</li>
+			<li class="fragment">Handled by a TI-based USB-PD controller</li>
+			<li class="fragment">Linux driver available!</li>
+			<li class="fragment">Host mode works as well</li>
+		</ul>
+	</section>
+	<section>
+
+<pre style="font-size: 15px;"><code data-trim data-noescape data-line-numbers="1-2|3-4|5-6|1-6">
+MMIO: R.4   PIPEHANDLER_AON_GEN = 0x1 (DWC3_FORCE_CLAMP_EN=0, DWC3_RESET_N=1)
+MMIO: W.4   PIPEHANDLER_AON_GEN = 0x10 (DWC3_FORCE_CLAMP_EN=1, DWC3_RESET_N=0)
+MMIO: R.4   USB2PHY_CTL = 0x4 (RESET=0, PORT_RESET=0, APB_RESETN=1, SIDDQ=0)
+MMIO: W.4   USB2PHY_CTL = 0xb (RESET=1, PORT_RESET=1, APB_RESETN=0, SIDDQ=1)
+MMIO: R.4   USB2PHY_MISCTUNE = 0x8c0013 (APBCLK_GATE_OFF=0, REFCLK_GATE_OFF=0)
+MMIO: W.4   USB2PHY_MISCTUNE = 0x608c0013 (APBCLK_GATE_OFF=1, REFCLK_GATE_OFF=1)
+</code></pre>
+
+		<ul>
+			<li class="fragment">USB-PD chip triggers hotplug interrupt with target role</li>
+			<li class="fragment">Power-up and bring up DWC3 and XHCI</li>
+			<li class="fragment">USB device probably works!</li>
+			<li class="fragment">USB-PD chip trigger unplug interrupt</li>
+			<li class="fragment">Tear down XHCI and DWC3 and assert hard reset</li>
+			<li class="fragment">Clean implementation thanks to upstream maintainer (Thinh Nguyen) </li>
+		</ul>
+	</section>
+	<!--
+	<section>
+		<ul>
+			<li>USB2-only so far</li>
+			<li class="fragment">USB3 is black magic and needs complicated PHY setup</li>
+			<li class="fragment">Trace PHY sequence from m1n1</li>
+			<li class="fragment">Enable XNU debug output and correlate to MMIO access</li>
+			<li class="fragment">Compare traces for different orientation, modes,.. across devices</li>
+			<li class="fragment">Getting the sequence correct took over 2 years... :-(</li>
+		</ul>
+	</section>-->
+	<section>
+		<ul>
+			<li>USB1/2 ✅</li>
+			<li>USB3</li>
+			<li>DisplayPort</li>
+			<li>Thunderbolt / USB4</li>
+		</ul>
+	</section>
+	<section>
+		<ul>
+			<li>USB1/2 ✅</li>
+			<li>USB3 ✅</li>
+			<li>DisplayPort</li>
+			<li>Thunderbolt / USB4</li>
+		</ul>
+	</section>
+	<section>
+		<!--<img src="dpalt_fedi.png" width="90%">-->
+		<div class="r-stack">
+			<p class="fragment fade-out" data-fragment-index="0" style="font-size: 12px;"><img src="dpalt_fedi.png"></p>
+			<p class="fragment current-visible" data-fragment-index="0" style="font-size: 12px;"><img src="dpalt_reddit.png"></p>
+		</div>
+	</section>
+	<section data-markdown="">
+		# DisplayPort  
+		https://github.com/AsahiLinux/linux/tree/fairydust  
+		meant for developers to help us iron out the last bugs
+	</section>
+	<section>
+		<ul>
+			<li>USB1/2 ✅</li>
+			<li>USB3 ✅</li>
+			<li>DisplayPort ✅</li>
+			<li>Thunderbolt / USB4</li>
+		</ul>
+	</section>
+</section>
+<section>
+	<section data-markdown="">
+		# The future: M3/M4/M5
+	</section>
+	<section data-markdown="">
+		# M3
+	</section>
+	<section>
+		<div class="r-stack">
+		<ul>
+			<li>A few changes:<ul>
+					<li>New chicken bits initialization sequence</li>
+					<li>PD controller moved from I2C to SPMI</li>
+					<li>Minor interrupt controller and NVMe changes</li>
+					<li>Co-processor communication changes</li>
+					<li>...</li>
+				</ul></li>
+			<li class="fragment">One huge change: GPU will need significant work</li>
+			<li class="fragment">New contributor <a href="https://github.com/IntegralPilot">IntegralPilot</a> has been working on M3 bringup in the past weeks</li>
+		</ul>
+		<img class="fragment" src="m3neofetch.jpeg">
+		<img class="fragment" src="m3doom.jpeg">
+		<div>
+	</section>
+	<section data-markdown="">
+		# M4/M5
+	</section>
+	<section><img src="el123.drawio.png"></section>
+	<section><img src="elgl123.drawio.png" style="float: left; width: 50%;">
+		<ul style="width: 40%;"><li>GL: guarded levels</li><li>same pagetables but different permissions</li><li>Only GL2 can modify pagestables</li><li>Custom ARM extension</li></ul></section>
+	<section data-markdown="">
+* On M1/M2/M3: Custom extension is available and we reverse engineered and enabled it to virtualize XNU under m1n1
+* M4/M5 with macho boot objects (i.e. XNU): EL2 with MMU enabled and Apple Code in GL2
+* M4/M5 with raw boot objects (i.e. Linux): EL2 without MMU enabled, all ISA extensions disabled
+* Fine for Linux, but breaks our reverse engineering tools :-(
+	</section>
+	<section data-markdown="">
+* Either: emulate GL2 on a "regular" ARM CPU: Trap genter/gexit and create shadow copies of pagetables
+* Or: Try to inject hardware driver kexts into vmapple XNU that can run without guarded levels
+	</section>
+</section>
+
+<section data-markdown="">
+# Thank you!
+
+fail0verflow assembly  
+email: sven@asahilinux.org  
+fedi: [@sven@treehouse.systems](https://social.treehouse.systems/@sven)    
+web: https://asahilinux.org  
+IRC: #asahi on OFTC
+</section>
 			</div>
 		</div>
 
